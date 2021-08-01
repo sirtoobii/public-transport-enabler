@@ -10,6 +10,7 @@ import org.json.JSONObject;
 import javax.annotation.Nullable;
 import java.io.IOException;
 import java.text.DateFormat;
+import java.text.ParseException;
 import java.text.SimpleDateFormat;
 import java.util.*;
 
@@ -22,11 +23,13 @@ import java.util.*;
  * <p>
  * TOS: https://timetable.search.ch/api/terms
  * </p>
+ *
  * @author Tobias Bossert
  * @apiNote https://timetable.search.ch/api/help
  */
 public class CHSearchProvider extends AbstractNetworkProvider {
     private static final HttpUrl API_BASE = HttpUrl.parse("https://timetable.search.ch/api/");
+    private static final int N_TRIPS = 8;
     private static final String COMPLETION_ENDPOINT = "completion.json";
     private static final String TRIP_ENDPOINT = "route.json";
     protected static final String SERVER_PRODUCT = "timetables.search.ch";
@@ -120,52 +123,74 @@ public class CHSearchProvider extends AbstractNetworkProvider {
             }
         });
         HttpUrl requestURL = builder.build();
+        System.out.println(requestURL);
         CharSequence res = httpClient.get(requestURL);
         try {
-            JSONObject jsonResult = new JSONObject(res.toString());
-            // Process Connections (Trips)
-            JSONArray connectionsResult = jsonResult.getJSONArray("connections");
-            List<Trip> trips = new ArrayList<>();
-            for (int i = 0; i < connectionsResult.length(); i++) {
-                JSONObject entry = connectionsResult.getJSONObject(i);
+            RouteResult routeResult = new RouteResult(new JSONObject(res.toString()));
+            List<Trip> tripsList = new ArrayList<>(N_TRIPS);
+            routeResult.connections.forEach(connection -> {
+                List<Trip.Leg> legsList = new ArrayList<>(10);
+                connection.legs.forEach(leg -> {
+                    List<Stop> intermediateStops = new ArrayList<>(20);
+                    Line currentLine;
 
-                // Process Legs
-                JSONArray legsResult = entry.getJSONArray("legs");
-                List<Trip.Leg> legs = new ArrayList<>();
-                for (int j = 0; j < legsResult.length(); j++) {
-                    JSONObject legEntry = legsResult.getJSONObject(j);
-                    String transportType = legEntry.getString("type");
-                    String lineName = legEntry.getString("line");
-                    String lineID = legEntry.getString("tripid");
-                    String networkOperator = legEntry.getString("operator");
-                    String lineTerminalDest = legEntry.getString("terminal");
-                    Line line = "walk".equals(transportType) ? Line.FOOTWAY : new Line(lineID, networkOperator, type2Product(transportType), lineName);
-                    Location terminalDestination = new Location(LocationType.ANY, null, null, lineTerminalDest, lineTerminalDest);
+                    // Departure
+                    Date plannedDeparture = leg.departure;
+                    Date expectedDeparture = addMinutesToDate(leg.departure, leg.dep_delay);
+                    Position planedDeparturePos = null;
 
-                    String departureName = legEntry.getString("name");
-                    double departureLat = legEntry.getDouble("lat");
-                    double departureLong = legEntry.getDouble("lon");
-                    String departureStationID = legEntry.getString("stopid");
-                    String departureTime = legEntry.getString("departure");
+                    // Arrival Stop
+                    Date plannedArrival = leg.arrival;
+                    Date expectedArrival = addMinutesToDate(leg.arrival, leg.arr_delay);
+                    Position planedArrivalPos = null;
 
-                    Location departureLocation = new Location(LocationType.STATION,
-                            departureStationID,
-                            Point.fromDouble(departureLat, departureLong),
-                            departureName,
-                            departureName
-                    );
-                    Stop departureStop = new Stop(departureLocation);
-                    Stop arrivalStop = new Stop();
+                    if (leg.is_walk) {
+                        currentLine = Line.FOOTWAY;
+                    } else {
+                        currentLine = new Line(leg.Z, leg.operator, type2Product(leg.G), leg.line, new Style(Style.Shape.RECT, leg.bgColor, leg.fgColor));
+                        planedDeparturePos = new Position(leg.track);
+                        planedArrivalPos = new Position(leg.exit.track);
 
-                    Location arrivalLocation = new Location();
+                    }
+                    Location destinationLocation = to;
 
-                }
 
-                Location loc = extractLocation(entry);
-            }
+                    Stop departureStop = new Stop(from, true, plannedDeparture, expectedDeparture, planedDeparturePos, null);
+
+
+                    Location arrivalLocation = new Location(leg.exit.isAddress ? LocationType.ADDRESS : LocationType.STATION, leg.exit.stopID, Point.fromDouble(leg.exit.lat, leg.exit.lon), null, leg.exit.name);
+                    Stop arrivalStop = new Stop(arrivalLocation, false, plannedArrival, expectedArrival, planedArrivalPos, null);
+
+                    legsList.add(new Trip.Public(currentLine, destinationLocation, departureStop, arrivalStop, intermediateStops, null, null));
+
+                    leg.stops.forEach(stop -> {
+                        if (!stop.isSpecial) {
+                            Location stopLocation = new Location(LocationType.STATION, stop.stopID, Point.fromDouble(stop.lat, stop.lon), null, stop.name);
+                            Date plannedArrivalTime = stop.arrival;
+                            Date expectedArrivalTime = addMinutesToDate(stop.arrival, stop.arr_delay);
+                            Date plannedDepartureTime = stop.departure;
+                            Date expectedDepartureTime = addMinutesToDate(stop.departure, stop.dep_delay);
+                            intermediateStops.add(new Stop(stopLocation,
+                                    plannedArrivalTime,
+                                    expectedArrivalTime,
+                                    null,
+                                    null,
+                                    plannedDepartureTime,
+                                    expectedDepartureTime,
+                                    null,
+                                    null));
+                        }
+                    });
+                });
+                tripsList.add(new Trip("generated" + UUID.randomUUID(), from, to, legsList, null, null, legsList.size()));
+            });
+            ResultHeader header = new ResultHeader(network, SERVER_PRODUCT);
+            return new QueryTripsResult(header, requestURL.toString(), from, to, via, null, tripsList);
 
         } catch (final JSONException x) {
-            throw new ParserException("queryTrips: cannot parse json:" + x);
+            throw new ParserException("JSON Error:" + x);
+        } catch (ParseException e) {
+            e.printStackTrace();
         }
         return null;
     }
@@ -183,16 +208,12 @@ public class CHSearchProvider extends AbstractNetworkProvider {
     private Product type2Product(String chSearchType) {
         HashMap<String, Product> mapping = new HashMap<>();
         // walk ??
-        mapping.put("express_train", Product.HIGH_SPEED_TRAIN);
-        mapping.put("bus", Product.BUS);
-        mapping.put("train", Product.REGIONAL_TRAIN);
-        mapping.put("tram", Product.TRAM);
+        mapping.put("IC", Product.HIGH_SPEED_TRAIN);
+        mapping.put("B", Product.BUS);
+        mapping.put("S", Product.REGIONAL_TRAIN);
+        mapping.put("T", Product.TRAM);
         mapping.put("cablecar", Product.CABLECAR);
-        return mapping.getOrDefault(chSearchType, Product.fromCode(Product.UNKNOWN));
-    }
-
-    private Line.Attr code2Attr(String code) {
-
+        return mapping.get(chSearchType);
     }
 
     private Location extractLocation(JSONObject locationEntry) throws JSONException {
@@ -207,5 +228,196 @@ public class CHSearchProvider extends AbstractNetworkProvider {
     @Override
     public QueryTripsResult queryMoreTrips(QueryTripsContext context, boolean later) throws IOException {
         return null;
+    }
+
+    private static Date addMinutesToDate(Date orig, long minutes) {
+        if (orig == null) return null;
+        long newTime = orig.getTime() + (1000 * 60 * minutes);
+        return new Date(newTime);
+    }
+
+    private static int delayParser(String delay){
+        try{
+            // Unfortunately "X" is not documented...
+            if ("X".equals(delay)) return 0;
+            return Integer.parseInt(delay);
+        } catch (NumberFormatException x){
+            System.out.println(x);
+        }
+        return 0;
+    }
+
+    private static class RouteResult {
+        public final int nConnections;
+        public final List<Connection> connections = new ArrayList<>(N_TRIPS);
+
+        RouteResult(JSONObject rawResult) throws JSONException, ParseException {
+            nConnections = rawResult.getInt("count");
+            JSONArray rawCons = rawResult.getJSONArray("connections");
+            for (int i = 0; i < rawCons.length(); i++) {
+                connections.add(new Connection(rawCons.getJSONObject(i)));
+            }
+        }
+
+        private static class Connection {
+            public final List<Leg> legs = new ArrayList<>();
+            protected static final SimpleDateFormat dateFormatter = new SimpleDateFormat("yyyy-MM-dd HH:mm:ss");
+            public final String from;
+            public final String to;
+            public final Date arrival;
+            public final Date departure;
+            public final double duration;
+
+            Connection(JSONObject rawConnection) throws JSONException, ParseException {
+                try {
+                    this.from = rawConnection.getString("from");
+                    this.to = rawConnection.getString("to");
+                    this.duration = rawConnection.getDouble("duration");
+                    this.arrival = dateFormatter.parse(rawConnection.getString("arrival"));
+                    this.departure = dateFormatter.parse(rawConnection.getString("departure"));
+
+                    JSONArray rawLegs = rawConnection.getJSONArray("legs");
+                    for (int i = 0; i < rawLegs.length(); i++) {
+                        legs.add(new Leg(rawLegs.getJSONObject(i)));
+                    }
+                } catch (JSONException x) {
+                    throw new JSONException("Connection::" + x);
+                }
+
+
+            }
+
+            private static class Leg {
+                public final Date departure;
+                public final Date arrival;
+                public final String tripID;
+                public final String stopID;
+                public final String name;
+                public final String Z; // Train number
+                public final String G; // Train Product
+                public final String terminal;
+                public final String line;
+                public final String type;
+                public final String operator;
+                public final int fgColor;
+                public final int bgColor;
+                public final double runningTime;
+                public final int dep_delay;
+                public final int arr_delay;
+                public final String track;
+                public final Double lat;
+                public final Double lon;
+                public final Exit exit;
+                public final List<Stop> stops = new ArrayList<>();
+                public final boolean is_walk;
+
+
+                public Leg(JSONObject rawLeg) throws JSONException, ParseException {
+                    try {
+                        this.departure = rawLeg.has("departure") ? dateFormatter.parse(rawLeg.getString("departure")) : dateFormatter.parse(rawLeg.getString("arrival"));
+                        this.arrival = rawLeg.has("arrival") ? dateFormatter.parse(rawLeg.getString("arrival")) : dateFormatter.parse(rawLeg.getString("departure"));
+                        this.type = rawLeg.has("type") ? rawLeg.getString("type") : "unknown";
+                        this.is_walk = "walk".equals(this.type);
+                        this.Z = rawLeg.has("*Z") ? rawLeg.getString("*Z") : "00000";
+                        this.G = rawLeg.has("*G") ? rawLeg.getString("*G") : "UNKN";
+                        this.name = rawLeg.getString("name");
+                        this.terminal = rawLeg.has("terminal") ? rawLeg.getString("terminal") : null;
+                        this.tripID = rawLeg.has("tripid") ? rawLeg.getString("tripid") : "generated_" + UUID.randomUUID();
+                        this.line = rawLeg.has("line") ? rawLeg.getString("line") : null;
+                        this.stopID = rawLeg.getString("stopid");
+                        this.operator = rawLeg.has("operator") ? rawLeg.getString("operator") : null;
+                        this.fgColor = rawLeg.has("fgcolor") ? Integer.parseInt(rawLeg.getString("fgcolor"), 16) : 0xff;
+                        this.bgColor = rawLeg.has("bgcolor") ? Integer.parseInt(rawLeg.getString("bgcolor"), 16) : 0x00;
+                        this.runningTime = rawLeg.has("runningtime") ? rawLeg.getDouble("runningtime") : 0;
+                        this.dep_delay = rawLeg.has("dep_delay") ? delayParser(rawLeg.getString("dep_delay")) : 0;
+                        this.arr_delay = rawLeg.has("arr_delay") ? delayParser(rawLeg.getString("arr_delay")) : 0;
+                        this.track = rawLeg.has("track") ? rawLeg.getString("track") : null;
+                        this.lat = rawLeg.getDouble("lat");
+                        this.lon = rawLeg.getDouble("lon");
+                        this.exit = rawLeg.has("exit") ? new Exit(rawLeg.getJSONObject("exit")) : null;
+
+                        if (rawLeg.has("stops") && !rawLeg.isNull("stops")) {
+                            JSONArray rawStops = rawLeg.getJSONArray("stops");
+                            for (int i = 0; i < rawStops.length(); i++) {
+                                stops.add(new Stop(rawStops.getJSONObject(i)));
+                            }
+                        }
+
+                    } catch (JSONException x) {
+                        throw new JSONException("Leg::" + x);
+                    }
+
+
+                }
+
+                private static class Exit {
+                    public final Date arrival;
+                    public final String stopID;
+                    public final String name;
+                    public final double waitTime;
+                    public final String track;
+                    public final int arr_delay;
+                    public final Double lat;
+                    public final Double lon;
+                    public final boolean isAddress;
+
+                    Exit(JSONObject rawExit) throws JSONException, ParseException {
+                        try {
+                            this.arrival = dateFormatter.parse(rawExit.getString("arrival"));
+                            this.stopID = rawExit.getString("stopid");
+                            this.name = rawExit.getString("name");
+                            this.waitTime = rawExit.has("waittime") ? rawExit.getDouble("waittime") : 0;
+                            this.track = rawExit.has("track") ? rawExit.getString("track") : null;
+                            this.arr_delay = rawExit.has("arr_delay") ? delayParser(rawExit.getString("arr_delay")) : 0;
+                            this.lat = rawExit.getDouble("lat");
+                            this.lon = rawExit.getDouble("lon");
+                            this.isAddress = rawExit.has("isaddress") && rawExit.getBoolean("isaddress");
+                        } catch (JSONException x) {
+                            throw new JSONException("Exit::" + x);
+                        }
+
+                    }
+                }
+
+                private static class Stop {
+                    public final @Nullable
+                    Date arrival;
+                    public final @Nullable
+                    Date departure;
+                    public final int dep_delay;
+                    public final int arr_delay;
+                    public final String stopID;
+                    public final String name;
+                    public final Double lat;
+                    public final Double lon;
+                    // Sometimes the we have no real "Stop" e.g (Löschbergbasis Tunnel) which means we have no arrival/departure times
+                    public boolean isSpecial = false;
+
+                    Stop(JSONObject rawStop) throws JSONException, ParseException {
+                        try {
+                            if (rawStop.has("arrival") || rawStop.has("departure")) {
+                                // The first stop does not have an arrival attribute an similarly the last no departure
+                                this.departure = rawStop.has("departure") ? dateFormatter.parse(rawStop.getString("departure")) : dateFormatter.parse(rawStop.getString("arrival"));
+                                this.arrival = rawStop.has("arrival") ? dateFormatter.parse(rawStop.getString("arrival")) : dateFormatter.parse(rawStop.getString("departure"));
+                            } else {
+                                this.isSpecial = true;
+                                this.departure = null;
+                                this.arrival = null;
+                            }
+                            this.dep_delay = rawStop.has("dep_delay") ? delayParser(rawStop.getString("dep_delay")) : 0;
+                            this.arr_delay = rawStop.has("arr_delay") ? delayParser(rawStop.getString("arr_delay")) : 0;
+                            this.stopID = rawStop.getString("stopid");
+                            this.name = rawStop.getString("name");
+                            this.lat = rawStop.getDouble("lat");
+                            this.lon = rawStop.getDouble("lon");
+                        } catch (JSONException x) {
+                            throw new JSONException("Stop::" + x);
+                        }
+
+                    }
+                }
+            }
+
+        }
     }
 }
