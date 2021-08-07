@@ -33,7 +33,12 @@ public class CHSearchProvider extends AbstractNetworkProvider {
     private static final int N_TRIPS = 8;
     private static final String COMPLETION_ENDPOINT = "completion.json";
     private static final String TRIP_ENDPOINT = "route.json";
+    private static final String STATIONBOARD_ENDPOINT = "stationboard.json";
     protected static final String SERVER_PRODUCT = "timetables.search.ch";
+    private static final DateFormat DATE_FORMATTER = new SimpleDateFormat("MM/dd/yyyy");
+    private static final DateFormat TIME_FORMATTER = new SimpleDateFormat("HH:mm");
+    protected static final SimpleDateFormat DATE_TIME_FORMATTER = new SimpleDateFormat("yyyy-MM-dd HH:mm:ss");
+
 
     private final List<Capability> CAPABILITIES = Arrays.asList(
             Capability.SUGGEST_LOCATIONS,
@@ -52,6 +57,15 @@ public class CHSearchProvider extends AbstractNetworkProvider {
         return CAPABILITIES.contains(capability);
     }
 
+    /**
+     * Finds nearby locations. Please note that locations without coordinates result in an additional query
+     *
+     * @param types        Location types (not supported!)
+     * @param location     A Location object, must have either a name or valid id.
+     * @param maxDistance  Distance (radius) from location in meters
+     * @param maxLocations Number of locations (not supported, is always 10!)
+     * @return A possibly empty list of <L>{@link Location}s</L>
+     */
     @Override
     public NearbyLocationsResult queryNearbyLocations(Set<LocationType> types, Location location, int maxDistance, int maxLocations) throws IOException {
         ResultHeader header = new ResultHeader(network, SERVER_PRODUCT);
@@ -81,9 +95,9 @@ public class CHSearchProvider extends AbstractNetworkProvider {
                 if (jsonResult.equals("")) {
                     return new NearbyLocationsResult(header, NearbyLocationsResult.Status.INVALID_ID);
                 }
-                JSONArray rawResult = new JSONArray(res.toString());
+                JSONArray rawResult = new JSONArray(jsonResult);
                 List<Location> suggestions = new ArrayList<>();
-                for (int i = 0; i < Math.min(rawResult.length(), maxLocations); i++) {
+                for (int i = 0; i < rawResult.length(); i++) {
                     JSONObject entry = rawResult.getJSONObject(i);
                     suggestions.add(extractLocation(entry));
                 }
@@ -96,11 +110,56 @@ public class CHSearchProvider extends AbstractNetworkProvider {
         }
     }
 
+    /**
+     * Returns all departing connections from a station id
+     *
+     * @param stationId     id (or name) of the station
+     * @param time          desired time for departing, or {@code null} for the provider default
+     * @param maxDepartures maximum number of departures to get or {@code 0}
+     * @param equivs        (Not supported!)
+     * @return List of departing connections
+     */
     @Override
     public QueryDeparturesResult queryDepartures(String stationId, @Nullable Date time, int maxDepartures, boolean equivs) throws IOException {
-        return null;
+        ResultHeader header = new ResultHeader(network, SERVER_PRODUCT);
+        // Set time to now if not set
+        time = time == null ? new Date() : time;
+
+        HttpUrl queryUrl = API_BASE.newBuilder()
+                .addPathSegment(STATIONBOARD_ENDPOINT)
+                .addQueryParameter("stop", stationId)
+                .addQueryParameter("date", DATE_FORMATTER.format(time))
+                .addQueryParameter("time", TIME_FORMATTER.format(time))
+                .addQueryParameter("limit", String.valueOf(maxDepartures))
+                .addQueryParameter("show_tracks", "1")
+                .addQueryParameter("show_delays", "1")
+                .build();
+
+        CharSequence res = httpClient.get(queryUrl);
+        try {
+            JSONObject rawResult = new JSONObject(res.toString());
+            if (rawResult.has("messages")){
+                return new QueryDeparturesResult(header, QueryDeparturesResult.Status.INVALID_STATION);
+            }
+            JSONArray rawEntries = rawResult.getJSONArray("connections");
+            for (int i = 0; i < rawEntries.length(); i++) {
+                StationBoardEntry se = new StationBoardEntry(rawEntries.getJSONObject(i));
+                // ToDo...
+            }
+            return null;
+        } catch (final JSONException | ParseException x) {
+            throw new ParserException("queryNearbyLocations: cannot parse json:" + x);
+        }
     }
 
+    /**
+     * Suggests stations, POIs or addresses based on user input
+     *
+     * @param constraint   Input by user so far
+     * @param types        Types of locations to suggest (not supported!)
+     * @param maxLocations Number of locations (not supported, is always 10!)
+     * @return A possibly empty list of <L>{@link Location}s</L>
+     */
     @Override
     public SuggestLocationsResult suggestLocations(CharSequence constraint, @Nullable Set<LocationType> types, int maxLocations) throws IOException {
         HttpUrl queryUrl = API_BASE.newBuilder()
@@ -113,7 +172,7 @@ public class CHSearchProvider extends AbstractNetworkProvider {
         try {
             JSONArray rawResult = new JSONArray(res.toString());
             List<SuggestedLocation> suggestions = new ArrayList<>();
-            for (int i = 0; i < Math.min(rawResult.length(), maxLocations); i++) {
+            for (int i = 0; i < rawResult.length(); i++) {
                 JSONObject entry = rawResult.getJSONObject(i);
                 suggestions.add(new SuggestedLocation(extractLocation(entry)));
             }
@@ -128,13 +187,11 @@ public class CHSearchProvider extends AbstractNetworkProvider {
     public QueryTripsResult queryTrips(Location from, @Nullable Location via, Location to, Date date, boolean dep, @Nullable TripOptions options) throws IOException {
 
         HashMap<String, String> rawParameters = new HashMap<>();
-        DateFormat dateFormatter = new SimpleDateFormat("MM/dd/yyyy");
-        DateFormat timeFormatter = new SimpleDateFormat("HH:mm");
         rawParameters.put("from", from.id == null ? from.name : from.id);
         rawParameters.put("to", to.id == null ? to.name : to.id);
         rawParameters.put("via", via != null ? via.id : null);
-        rawParameters.put("date", dateFormatter.format(date));
-        rawParameters.put("time", timeFormatter.format(date));
+        rawParameters.put("date", DATE_FORMATTER.format(date));
+        rawParameters.put("time", TIME_FORMATTER.format(date));
         rawParameters.put("time_type", dep ? "depart" : "arrival");
         rawParameters.put("show_delays", "1");
         rawParameters.put("show_trackchanges", "1");
@@ -319,7 +376,6 @@ public class CHSearchProvider extends AbstractNetworkProvider {
 
         private static class Connection {
             public final List<Leg> legs = new ArrayList<>();
-            protected static final SimpleDateFormat dateFormatter = new SimpleDateFormat("yyyy-MM-dd HH:mm:ss");
             public final String from;
             public final String to;
             public final Date arrival;
@@ -331,8 +387,8 @@ public class CHSearchProvider extends AbstractNetworkProvider {
                     this.from = rawConnection.getString("from");
                     this.to = rawConnection.getString("to");
                     this.duration = rawConnection.getDouble("duration");
-                    this.arrival = dateFormatter.parse(rawConnection.getString("arrival"));
-                    this.departure = dateFormatter.parse(rawConnection.getString("departure"));
+                    this.arrival = DATE_TIME_FORMATTER.parse(rawConnection.getString("arrival"));
+                    this.departure = DATE_TIME_FORMATTER.parse(rawConnection.getString("departure"));
 
                     JSONArray rawLegs = rawConnection.getJSONArray("legs");
                     for (int i = 0; i < rawLegs.length(); i++) {
@@ -373,8 +429,8 @@ public class CHSearchProvider extends AbstractNetworkProvider {
 
                 public Leg(JSONObject rawLeg) throws JSONException, ParseException {
                     try {
-                        this.departure = rawLeg.has("departure") ? dateFormatter.parse(rawLeg.getString("departure")) : dateFormatter.parse(rawLeg.getString("arrival"));
-                        this.arrival = rawLeg.has("arrival") ? dateFormatter.parse(rawLeg.getString("arrival")) : dateFormatter.parse(rawLeg.getString("departure"));
+                        this.departure = rawLeg.has("departure") ? DATE_TIME_FORMATTER.parse(rawLeg.getString("departure")) : DATE_TIME_FORMATTER.parse(rawLeg.getString("arrival"));
+                        this.arrival = rawLeg.has("arrival") ? DATE_TIME_FORMATTER.parse(rawLeg.getString("arrival")) : DATE_TIME_FORMATTER.parse(rawLeg.getString("departure"));
                         this.type = rawLeg.has("type") ? rawLeg.getString("type") : "unknown";
                         this.is_walk = "walk".equals(this.type);
                         this.Z = rawLeg.has("*Z") ? rawLeg.getString("*Z") : "00000";
@@ -423,7 +479,7 @@ public class CHSearchProvider extends AbstractNetworkProvider {
 
                     Exit(JSONObject rawExit) throws JSONException, ParseException {
                         try {
-                            this.arrival = dateFormatter.parse(rawExit.getString("arrival"));
+                            this.arrival = DATE_TIME_FORMATTER.parse(rawExit.getString("arrival"));
                             this.stopID = rawExit.has("stopid") ? rawExit.getString("stopid") : null;
                             this.name = rawExit.getString("name");
                             this.waitTime = rawExit.has("waittime") ? rawExit.getDouble("waittime") : 0;
@@ -457,8 +513,8 @@ public class CHSearchProvider extends AbstractNetworkProvider {
                         try {
                             if (rawStop.has("arrival") || rawStop.has("departure")) {
                                 // The first stop does not have an arrival attribute an similarly the last no departure
-                                this.departure = rawStop.has("departure") ? dateFormatter.parse(rawStop.getString("departure")) : dateFormatter.parse(rawStop.getString("arrival"));
-                                this.arrival = rawStop.has("arrival") ? dateFormatter.parse(rawStop.getString("arrival")) : dateFormatter.parse(rawStop.getString("departure"));
+                                this.departure = rawStop.has("departure") ? DATE_TIME_FORMATTER.parse(rawStop.getString("departure")) : DATE_TIME_FORMATTER.parse(rawStop.getString("arrival"));
+                                this.arrival = rawStop.has("arrival") ? DATE_TIME_FORMATTER.parse(rawStop.getString("arrival")) : DATE_TIME_FORMATTER.parse(rawStop.getString("departure"));
                             } else {
                                 this.isSpecial = true;
                                 this.departure = null;
@@ -478,6 +534,43 @@ public class CHSearchProvider extends AbstractNetworkProvider {
                 }
             }
 
+        }
+    }
+
+    private static class StationBoardEntry {
+        public final Date time;
+        public final String G;
+        public final String L;
+        public final String line;
+        public final String operator;
+        public final int fgColor;
+        public final int bgColor;
+        public Terminal terminal;
+
+        public StationBoardEntry(JSONObject rawEntry) throws JSONException, ParseException {
+            this.time = DATE_TIME_FORMATTER.parse(rawEntry.getString("time"));
+            G = rawEntry.getString("*G");
+            L = rawEntry.getString("*L");
+            this.line = rawEntry.getString("line");
+            this.operator = rawEntry.getString("operator");
+            String[] colors = rawEntry.getString("color").split("~", 3);
+            this.fgColor = Integer.parseInt((colors[0]), 16);
+            this.bgColor = Integer.parseInt((colors[1]), 16);
+            this.terminal = new Terminal(rawEntry.getJSONObject("terminal"));
+        }
+
+        private static class Terminal {
+            public final String stationID;
+            public final String name;
+            public final double lat;
+            public final double lon;
+
+            public Terminal(JSONObject rawTerminal) throws JSONException {
+                this.stationID = rawTerminal.getString("id");
+                this.name = rawTerminal.getString("name");
+                this.lat = rawTerminal.getDouble("lat");
+                this.lon = rawTerminal.getDouble("lon");
+            }
         }
     }
 
