@@ -13,6 +13,7 @@ import java.text.DateFormat;
 import java.text.ParseException;
 import java.text.SimpleDateFormat;
 import java.util.*;
+import java.util.concurrent.atomic.AtomicInteger;
 
 /**
  * Implementation of timetables.search.ch provider.
@@ -53,24 +54,45 @@ public class CHSearchProvider extends AbstractNetworkProvider {
 
     @Override
     public NearbyLocationsResult queryNearbyLocations(Set<LocationType> types, Location location, int maxDistance, int maxLocations) throws IOException {
-        CharSequence res = httpClient.get(API_BASE.newBuilder()
-                .addPathSegment(COMPLETION_ENDPOINT)
-                .addQueryParameter("latlon", location.coord.toString())
-                .addQueryParameter("accuracy", Integer.toString(maxDistance))
-                .addQueryParameter("show_ids", "1")
-                .addQueryParameter("show_coordinates", "1")
-                .build());
-        try {
-            JSONArray rawResult = new JSONArray(res.toString());
-            List<Location> suggestions = new ArrayList<>();
-            for (int i = 0; i < Math.min(rawResult.length(), maxLocations); i++) {
-                JSONObject entry = rawResult.getJSONObject(i);
-                suggestions.add(extractLocation(entry));
+        ResultHeader header = new ResultHeader(network, SERVER_PRODUCT);
+
+        // Since the endpoint only supports lat/long we have to get the coordinates first (if not already supplied)
+        Location fixedLocation = location;
+        if (location.coord == null && location.id != null) {
+            SuggestLocationsResult suggestionResult = this.suggestLocations(location.id, null, 2);
+            if (suggestionResult.suggestedLocations == null || suggestionResult.suggestedLocations.size() != 1) {
+                return new NearbyLocationsResult(header, NearbyLocationsResult.Status.INVALID_ID);
+            } else {
+                fixedLocation = suggestionResult.suggestedLocations.get(0).location;
             }
-            ResultHeader header = new ResultHeader(network, SERVER_PRODUCT);
-            return new NearbyLocationsResult(header, suggestions);
-        } catch (final JSONException x) {
-            throw new ParserException("queryNearbyLocations: cannot parse json:" + x);
+        }
+        if (fixedLocation.coord != null) {
+            String latlon = String.format("%f,%f", fixedLocation.coord.getLatAsDouble(), fixedLocation.coord.getLonAsDouble());
+            HttpUrl queryUrl = API_BASE.newBuilder()
+                    .addPathSegment(COMPLETION_ENDPOINT)
+                    .addQueryParameter("latlon", latlon)
+                    .addQueryParameter("accuracy", Integer.toString(maxDistance))
+                    .addQueryParameter("show_ids", "1")
+                    .addQueryParameter("show_coordinates", "1")
+                    .build();
+            CharSequence res = httpClient.get(queryUrl);
+            try {
+                String jsonResult = res.toString();
+                if (jsonResult.equals("")) {
+                    return new NearbyLocationsResult(header, NearbyLocationsResult.Status.INVALID_ID);
+                }
+                JSONArray rawResult = new JSONArray(res.toString());
+                List<Location> suggestions = new ArrayList<>();
+                for (int i = 0; i < Math.min(rawResult.length(), maxLocations); i++) {
+                    JSONObject entry = rawResult.getJSONObject(i);
+                    suggestions.add(extractLocation(entry));
+                }
+                return new NearbyLocationsResult(header, suggestions);
+            } catch (final JSONException x) {
+                throw new ParserException("queryNearbyLocations: cannot parse json:" + x);
+            }
+        } else {
+            return new NearbyLocationsResult(header, NearbyLocationsResult.Status.INVALID_ID);
         }
     }
 
@@ -81,12 +103,13 @@ public class CHSearchProvider extends AbstractNetworkProvider {
 
     @Override
     public SuggestLocationsResult suggestLocations(CharSequence constraint, @Nullable Set<LocationType> types, int maxLocations) throws IOException {
-        CharSequence res = httpClient.get(API_BASE.newBuilder()
+        HttpUrl queryUrl = API_BASE.newBuilder()
                 .addPathSegment(COMPLETION_ENDPOINT)
                 .addQueryParameter("term", constraint.toString())
                 .addQueryParameter("show_ids", "1")
                 .addQueryParameter("show_coordinates", "1")
-                .build());
+                .build();
+        CharSequence res = httpClient.get(queryUrl);
         try {
             JSONArray rawResult = new JSONArray(res.toString());
             List<SuggestedLocation> suggestions = new ArrayList<>();
@@ -103,11 +126,12 @@ public class CHSearchProvider extends AbstractNetworkProvider {
 
     @Override
     public QueryTripsResult queryTrips(Location from, @Nullable Location via, Location to, Date date, boolean dep, @Nullable TripOptions options) throws IOException {
+
         HashMap<String, String> rawParameters = new HashMap<>();
         DateFormat dateFormatter = new SimpleDateFormat("MM/dd/yyyy");
         DateFormat timeFormatter = new SimpleDateFormat("HH:mm");
-        rawParameters.put("from", from.id);
-        rawParameters.put("to", to.id);
+        rawParameters.put("from", from.id == null ? from.name : from.id);
+        rawParameters.put("to", to.id == null ? to.name : to.id);
         rawParameters.put("via", via != null ? via.id : null);
         rawParameters.put("date", dateFormatter.format(date));
         rawParameters.put("time", timeFormatter.format(date));
@@ -123,16 +147,16 @@ public class CHSearchProvider extends AbstractNetworkProvider {
             }
         });
         HttpUrl requestURL = builder.build();
-        System.out.println(requestURL);
         CharSequence res = httpClient.get(requestURL);
         try {
             RouteResult routeResult = new RouteResult(new JSONObject(res.toString()));
             List<Trip> tripsList = new ArrayList<>(N_TRIPS);
             routeResult.connections.forEach(connection -> {
+                AtomicInteger numChanges = new AtomicInteger(-1);
                 List<Trip.Leg> legsList = new ArrayList<>(10);
                 connection.legs.forEach(leg -> {
                     List<Stop> intermediateStops = new ArrayList<>(20);
-                    Line currentLine;
+                    Line currentLine = null;
 
                     // Departure
                     Date plannedDeparture = leg.departure;
@@ -144,21 +168,32 @@ public class CHSearchProvider extends AbstractNetworkProvider {
                     Date expectedArrival = addMinutesToDate(leg.arrival, leg.arr_delay);
                     Position planedArrivalPos = null;
 
+                    Location arrivalLocation;
+                    // Some legs do not have location data...
+                    Point legLocation = leg.lon != null ? Point.fromDouble(leg.lat, leg.lon) : null;
+
                     if (leg.is_walk) {
                         currentLine = Line.FOOTWAY;
+                        arrivalLocation = new Location(leg.isAddress ? LocationType.ADDRESS : LocationType.STATION, leg.stopID, legLocation, null, leg.name);
                     } else {
-                        currentLine = new Line(leg.Z, leg.operator, type2Product(leg.G), leg.line, new Style(Style.Shape.RECT, leg.bgColor, leg.fgColor));
-                        planedDeparturePos = new Position(leg.track);
-                        planedArrivalPos = new Position(leg.exit.track);
-
+                        // The last leg-entry is our destination and therefore we have no exit attribute
+                        if (leg.exit != null) {
+                            numChanges.getAndIncrement();
+                            // Some bus-stops in rural areas do not have a track name..
+                            planedDeparturePos = leg.track != null ? new Position(leg.track) : null;
+                            planedArrivalPos = leg.exit.track != null ? new Position(leg.exit.track) : null;
+                            currentLine = new Line(leg.Z, leg.operator, type2Product(leg.G), leg.line, new Style(Style.Shape.RECT, leg.bgColor, leg.fgColor));
+                            arrivalLocation = new Location(leg.exit.isAddress ? LocationType.ADDRESS : LocationType.STATION, leg.exit.stopID, Point.fromDouble(leg.exit.lat, leg.exit.lon), null, leg.exit.name);
+                        } else {
+                            arrivalLocation = new Location(leg.isAddress ? LocationType.ADDRESS : LocationType.STATION, leg.stopID, legLocation, null, leg.name);
+                            currentLine = Line.TRANSFER;
+                        }
                     }
                     Location destinationLocation = to;
 
 
                     Stop departureStop = new Stop(from, true, plannedDeparture, expectedDeparture, planedDeparturePos, null);
 
-
-                    Location arrivalLocation = new Location(leg.exit.isAddress ? LocationType.ADDRESS : LocationType.STATION, leg.exit.stopID, Point.fromDouble(leg.exit.lat, leg.exit.lon), null, leg.exit.name);
                     Stop arrivalStop = new Stop(arrivalLocation, false, plannedArrival, expectedArrival, planedArrivalPos, null);
 
                     legsList.add(new Trip.Public(currentLine, destinationLocation, departureStop, arrivalStop, intermediateStops, null, null));
@@ -182,10 +217,13 @@ public class CHSearchProvider extends AbstractNetworkProvider {
                         }
                     });
                 });
-                tripsList.add(new Trip("generated" + UUID.randomUUID(), from, to, legsList, null, null, legsList.size()));
+                tripsList.add(new Trip("generated" + UUID.randomUUID(), from, to, legsList, null, null, numChanges.get()));
             });
             ResultHeader header = new ResultHeader(network, SERVER_PRODUCT);
-            return new QueryTripsResult(header, requestURL.toString(), from, to, via, null, tripsList);
+            Date lastDeparture = tripsList.get(tripsList.size() - 1).getFirstPublicLeg().getDepartureTime();
+            Date firstArrival = tripsList.get(0).getLastPublicLeg().getArrivalTime();
+            CHSearchContext context = new CHSearchContext(from, to, via, firstArrival, lastDeparture, dep, options);
+            return new QueryTripsResult(header, requestURL.toString(), from, to, via, context, tripsList);
 
         } catch (final JSONException x) {
             throw new ParserException("JSON Error:" + x);
@@ -193,6 +231,19 @@ public class CHSearchProvider extends AbstractNetworkProvider {
             e.printStackTrace();
         }
         return null;
+    }
+
+    @Override
+    public QueryTripsResult queryMoreTrips(QueryTripsContext context, boolean later) throws IOException {
+        CHSearchContext chCont = (CHSearchContext) context;
+        if (later) {
+            // later
+            return queryTrips(chCont.from, chCont.via, chCont.to, addMinutesToDate(chCont.lastDeparture, 1), true, chCont.options);
+        } else {
+            // before
+            return queryTrips(chCont.from, chCont.via, chCont.to, addMinutesToDate(chCont.firstArrival, -1), false, chCont.options);
+        }
+
     }
 
     private Map<String, String> prepareQueryParameters(Map<String, String> input) {
@@ -217,17 +268,15 @@ public class CHSearchProvider extends AbstractNetworkProvider {
     }
 
     private Location extractLocation(JSONObject locationEntry) throws JSONException {
+        // Sometime there is no station-id and location
+        String stationID = locationEntry.has("id") ? locationEntry.getString("id") : null;
+        Point stationLocation = locationEntry.has("lat") ? Point.fromDouble(locationEntry.getDouble("lat"), locationEntry.getDouble("lon")) : null;
         return new Location(
                 LocationType.STATION,
-                locationEntry.getString("id"),
-                Point.fromDouble(locationEntry.getDouble("lat"), locationEntry.getDouble("lon")),
+                stationID,
+                stationLocation,
                 null,
                 locationEntry.getString("label"));
-    }
-
-    @Override
-    public QueryTripsResult queryMoreTrips(QueryTripsContext context, boolean later) throws IOException {
-        return null;
     }
 
     private static Date addMinutesToDate(Date orig, long minutes) {
@@ -236,12 +285,12 @@ public class CHSearchProvider extends AbstractNetworkProvider {
         return new Date(newTime);
     }
 
-    private static int delayParser(String delay){
-        try{
+    private static int delayParser(String delay) {
+        try {
             // Unfortunately "X" is not documented...
             if ("X".equals(delay)) return 0;
             return Integer.parseInt(delay);
-        } catch (NumberFormatException x){
+        } catch (NumberFormatException x) {
             System.out.println(x);
         }
         return 0;
@@ -249,14 +298,23 @@ public class CHSearchProvider extends AbstractNetworkProvider {
 
     private static class RouteResult {
         public final int nConnections;
+        public final String error;
         public final List<Connection> connections = new ArrayList<>(N_TRIPS);
 
         RouteResult(JSONObject rawResult) throws JSONException, ParseException {
-            nConnections = rawResult.getInt("count");
-            JSONArray rawCons = rawResult.getJSONArray("connections");
-            for (int i = 0; i < rawCons.length(); i++) {
-                connections.add(new Connection(rawCons.getJSONObject(i)));
+            if (rawResult.has("error")) {
+                this.error = rawResult.getString("error");
+                this.nConnections = 0;
+            } else {
+                nConnections = rawResult.getInt("count");
+                this.error = "";
+                JSONArray rawCons = rawResult.getJSONArray("connections");
+                for (int i = 0; i < rawCons.length(); i++) {
+                    connections.add(new Connection(rawCons.getJSONObject(i)));
+                }
             }
+
+
         }
 
         private static class Connection {
@@ -307,6 +365,7 @@ public class CHSearchProvider extends AbstractNetworkProvider {
                 public final String track;
                 public final Double lat;
                 public final Double lon;
+                public final boolean isAddress;
                 public final Exit exit;
                 public final List<Stop> stops = new ArrayList<>();
                 public final boolean is_walk;
@@ -324,7 +383,7 @@ public class CHSearchProvider extends AbstractNetworkProvider {
                         this.terminal = rawLeg.has("terminal") ? rawLeg.getString("terminal") : null;
                         this.tripID = rawLeg.has("tripid") ? rawLeg.getString("tripid") : "generated_" + UUID.randomUUID();
                         this.line = rawLeg.has("line") ? rawLeg.getString("line") : null;
-                        this.stopID = rawLeg.getString("stopid");
+                        this.stopID = rawLeg.has("stopid") ? rawLeg.getString("stopid") : null;
                         this.operator = rawLeg.has("operator") ? rawLeg.getString("operator") : null;
                         this.fgColor = rawLeg.has("fgcolor") ? Integer.parseInt(rawLeg.getString("fgcolor"), 16) : 0xff;
                         this.bgColor = rawLeg.has("bgcolor") ? Integer.parseInt(rawLeg.getString("bgcolor"), 16) : 0x00;
@@ -332,8 +391,9 @@ public class CHSearchProvider extends AbstractNetworkProvider {
                         this.dep_delay = rawLeg.has("dep_delay") ? delayParser(rawLeg.getString("dep_delay")) : 0;
                         this.arr_delay = rawLeg.has("arr_delay") ? delayParser(rawLeg.getString("arr_delay")) : 0;
                         this.track = rawLeg.has("track") ? rawLeg.getString("track") : null;
-                        this.lat = rawLeg.getDouble("lat");
-                        this.lon = rawLeg.getDouble("lon");
+                        this.lat = rawLeg.has("lat") ? rawLeg.getDouble("lat") : null;
+                        this.lon = rawLeg.has("lon") ? rawLeg.getDouble("lon") : null;
+                        this.isAddress = rawLeg.has("isaddress") && rawLeg.getBoolean("isaddress");
                         this.exit = rawLeg.has("exit") ? new Exit(rawLeg.getJSONObject("exit")) : null;
 
                         if (rawLeg.has("stops") && !rawLeg.isNull("stops")) {
@@ -364,13 +424,13 @@ public class CHSearchProvider extends AbstractNetworkProvider {
                     Exit(JSONObject rawExit) throws JSONException, ParseException {
                         try {
                             this.arrival = dateFormatter.parse(rawExit.getString("arrival"));
-                            this.stopID = rawExit.getString("stopid");
+                            this.stopID = rawExit.has("stopid") ? rawExit.getString("stopid") : null;
                             this.name = rawExit.getString("name");
                             this.waitTime = rawExit.has("waittime") ? rawExit.getDouble("waittime") : 0;
                             this.track = rawExit.has("track") ? rawExit.getString("track") : null;
                             this.arr_delay = rawExit.has("arr_delay") ? delayParser(rawExit.getString("arr_delay")) : 0;
-                            this.lat = rawExit.getDouble("lat");
-                            this.lon = rawExit.getDouble("lon");
+                            this.lat = rawExit.has("lat") ? rawExit.getDouble("lat") : null;
+                            this.lon = rawExit.has("lon") ? rawExit.getDouble("lon") : null;
                             this.isAddress = rawExit.has("isaddress") && rawExit.getBoolean("isaddress");
                         } catch (JSONException x) {
                             throw new JSONException("Exit::" + x);
@@ -418,6 +478,40 @@ public class CHSearchProvider extends AbstractNetworkProvider {
                 }
             }
 
+        }
+    }
+
+    public static class CHSearchContext implements QueryTripsContext {
+        private final Location from;
+        private final Location to;
+        private final @Nullable
+        Location via;
+        private final @Nullable
+        Date lastDeparture;
+        private final @Nullable
+        Date firstArrival;
+        private final boolean isDeparture;
+        private final @Nullable
+        TripOptions options;
+
+        public CHSearchContext(Location from, Location to, @Nullable Location via, @Nullable Date fristArrival, @Nullable Date lastDeparture, boolean isDeparture, @Nullable TripOptions options) {
+            this.from = from;
+            this.to = to;
+            this.via = via;
+            this.lastDeparture = lastDeparture;
+            this.firstArrival = fristArrival;
+            this.isDeparture = isDeparture;
+            this.options = options;
+        }
+
+        @Override
+        public boolean canQueryLater() {
+            return lastDeparture != null;
+        }
+
+        @Override
+        public boolean canQueryEarlier() {
+            return firstArrival != null;
         }
     }
 }
