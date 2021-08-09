@@ -241,7 +241,6 @@ public class CHSearchProvider extends AbstractNetworkProvider {
                 List<Trip.Leg> legsList = new ArrayList<>(10);
                 connection.legs.forEach(leg -> {
                     List<Stop> intermediateStops = new ArrayList<>(20);
-                    Line currentLine = null;
 
                     // Departure
                     Date plannedDeparture = leg.departure;
@@ -249,58 +248,59 @@ public class CHSearchProvider extends AbstractNetworkProvider {
                     Position planedDeparturePos = null;
 
                     // Arrival Stop
-                    Date plannedArrival = leg.arrival;
-                    Date expectedArrival = addMinutesToDate(leg.arrival, leg.arr_delay);
                     Position planedArrivalPos = null;
 
                     Location arrivalLocation;
-                    // Some legs do not have location data...
-                    Point legLocation = leg.lon != null ? Point.fromDouble(leg.lat, leg.lon) : null;
+                    Location departureLocation;
 
-                    if (leg.is_walk) {
-                        currentLine = Line.FOOTWAY;
-                        arrivalLocation = new Location(leg.isAddress ? LocationType.ADDRESS : LocationType.STATION, leg.stopID, legLocation, null, leg.name);
-                    } else {
-                        // The last leg-entry is our destination and therefore we have no exit attribute
-                        if (leg.exit != null) {
-                            numChanges.getAndIncrement();
-                            // Some bus-stops in rural areas do not have a track name..
-                            planedDeparturePos = leg.track != null ? new Position(leg.track) : null;
-                            planedArrivalPos = leg.exit.track != null ? new Position(leg.exit.track) : null;
-                            currentLine = new Line(leg.Z, leg.operator, type2Product(leg.G), leg.line, new Style(Style.Shape.RECT, leg.bgColor, leg.fgColor));
-                            arrivalLocation = new Location(leg.exit.isAddress ? LocationType.ADDRESS : LocationType.STATION, leg.exit.stopID, Point.fromDouble(leg.exit.lat, leg.exit.lon), null, leg.exit.name);
+                    if (leg.exit != null) {
+                        // Some legs do not have location data...
+                        Point legExitLocation = leg.exit.lon != null ? Point.fromDouble(leg.exit.lat, leg.exit.lon) : null;
+                        Point legLocation = leg.lon != null ? Point.fromDouble(leg.lat, leg.lon) : null;
+
+                        // Some bus-stops in rural areas do not have a track name..
+                        planedDeparturePos = leg.track != null ? new Position(leg.track) : null;
+                        planedArrivalPos = leg.exit.track != null ? new Position(leg.exit.track) : null;
+
+                        Date plannedArrival = leg.exit.arrival;
+                        Date expectedArrival = addMinutesToDate(leg.exit.arrival, leg.exit.arr_delay);
+                        arrivalLocation = new Location(leg.exit.isAddress ? LocationType.ADDRESS : LocationType.STATION, leg.exit.stopID, legExitLocation, null, leg.exit.name);
+                        departureLocation = new Location(leg.isAddress ? LocationType.ADDRESS : LocationType.STATION, leg.stopID, legLocation, null, leg.name);
+
+                        Stop departureStop = new Stop(departureLocation, true, plannedDeparture, expectedDeparture, planedDeparturePos, null, leg.cancelled);
+                        Stop arrivalStop = new Stop(arrivalLocation, false, plannedArrival, expectedArrival, planedArrivalPos, null, leg.cancelled);
+                        String infoText = String.join(",", leg.infotexts);
+                        if (leg.is_walk) {
+                            legsList.add(new Trip.Individual(Trip.Individual.Type.WALK, departureLocation, plannedDeparture, arrivalLocation, plannedArrival, null, 0));
                         } else {
-                            arrivalLocation = new Location(leg.isAddress ? LocationType.ADDRESS : LocationType.STATION, leg.stopID, legLocation, null, leg.name);
-                            currentLine = Line.TRANSFER;
+                            numChanges.getAndIncrement();
+                            Line line = new Line(leg.Z, leg.operator, type2Product(leg.G), leg.line, new Style(Style.Shape.RECT, leg.bgColor, leg.fgColor));
+                            legsList.add(new Trip.Public(line, arrivalLocation, departureStop, arrivalStop, intermediateStops, null, infoText + String.join(",", disruptions)));
                         }
+
+                        leg.stops.forEach(stop -> {
+                            if (!stop.isSpecial) {
+                                Location stopLocation = new Location(LocationType.STATION, stop.stopID, Point.fromDouble(stop.lat, stop.lon), null, stop.name);
+                                Date plannedArrivalTime = stop.arrival;
+                                Date expectedArrivalTime = addMinutesToDate(stop.arrival, stop.arr_delay);
+                                Date plannedDepartureTime = stop.departure;
+                                Date expectedDepartureTime = addMinutesToDate(stop.departure, stop.dep_delay);
+                                intermediateStops.add(new Stop(stopLocation,
+                                        plannedArrivalTime,
+                                        expectedArrivalTime,
+                                        null,
+                                        null,
+                                        plannedDepartureTime,
+                                        expectedDepartureTime,
+                                        null,
+                                        null));
+                            }
+                        });
+
+                    } else {
+                        // We reached the final leg which is our destination (and identical with the last "Exit")
+                        return;
                     }
-                    Location destinationLocation = to;
-
-                    Stop departureStop = new Stop(from, true, plannedDeparture, expectedDeparture, planedDeparturePos, null, leg.cancelled);
-
-                    Stop arrivalStop = new Stop(arrivalLocation, false, plannedArrival, expectedArrival, planedArrivalPos, null, leg.cancelled);
-                    String infoText = String.join(",", leg.infotexts);
-
-                    legsList.add(new Trip.Public(currentLine, destinationLocation, departureStop, arrivalStop, intermediateStops, null, infoText + String.join(",", disruptions)));
-
-                    leg.stops.forEach(stop -> {
-                        if (!stop.isSpecial) {
-                            Location stopLocation = new Location(LocationType.STATION, stop.stopID, Point.fromDouble(stop.lat, stop.lon), null, stop.name);
-                            Date plannedArrivalTime = stop.arrival;
-                            Date expectedArrivalTime = addMinutesToDate(stop.arrival, stop.arr_delay);
-                            Date plannedDepartureTime = stop.departure;
-                            Date expectedDepartureTime = addMinutesToDate(stop.departure, stop.dep_delay);
-                            intermediateStops.add(new Stop(stopLocation,
-                                    plannedArrivalTime,
-                                    expectedArrivalTime,
-                                    null,
-                                    null,
-                                    plannedDepartureTime,
-                                    expectedDepartureTime,
-                                    null,
-                                    null));
-                        }
-                    });
                 });
                 tripsList.add(new Trip("generated_" + UUID.randomUUID(), from, to, legsList, null, null, numChanges.get()));
             });
@@ -330,10 +330,14 @@ public class CHSearchProvider extends AbstractNetworkProvider {
 
     }
 
-    private Product type2Product(String chSearchType) {
+    private static Product type2Product(String chSearchType) {
         HashMap<String, Product> mapping = new HashMap<>();
-        // walk ??
         mapping.put("IC", Product.HIGH_SPEED_TRAIN);
+        mapping.put("ICE", Product.HIGH_SPEED_TRAIN);
+        mapping.put("RJX", Product.HIGH_SPEED_TRAIN); // RailJetExpress
+        mapping.put("IR", Product.HIGH_SPEED_TRAIN);
+        mapping.put("EC", Product.HIGH_SPEED_TRAIN);
+        mapping.put("RE", Product.REGIONAL_TRAIN);
         mapping.put("B", Product.BUS);
         mapping.put("S", Product.REGIONAL_TRAIN);
         mapping.put("T", Product.TRAM);
@@ -369,6 +373,24 @@ public class CHSearchProvider extends AbstractNetworkProvider {
             System.out.println(x);
         }
         return 0;
+    }
+
+    private static int hexColor2int(String hexValue) {
+        //Unfortunately they mix between short and long from...
+        //ToDo: This method does not work correctly (yet)....
+        if (hexValue.length() == 3) {
+            char[] seq = {
+                    hexValue.charAt(0), hexValue.charAt(0),
+                    hexValue.charAt(1), hexValue.charAt(1),
+                    hexValue.charAt(2), hexValue.charAt(2),
+                    '0','0'
+            };
+            return Integer.parseUnsignedInt(new String(seq), 16);
+        } else if (hexValue.length() == 6) {
+            return Integer.parseUnsignedInt(hexValue + "00", 16);
+        } else {
+            throw new NumberFormatException("hex value has more than six bytes");
+        }
     }
 
     private static class RouteResult {
@@ -409,7 +431,7 @@ public class CHSearchProvider extends AbstractNetworkProvider {
             public final Date arrival;
             public final Date departure;
             public final double duration;
-            public final List<Disruption> disruptions = new ArrayList<>();
+            public final List<Disruption> disruptions;
 
             Connection(JSONObject rawConnection) throws JSONException, ParseException {
                 try {
@@ -418,16 +440,7 @@ public class CHSearchProvider extends AbstractNetworkProvider {
                     this.duration = rawConnection.getDouble("duration");
                     this.arrival = DATE_TIME_FORMATTER.parse(rawConnection.getString("arrival"));
                     this.departure = DATE_TIME_FORMATTER.parse(rawConnection.getString("departure"));
-
-                    if (rawConnection.has("disruptions")) {
-                        JSONObject rawDisruptions = rawConnection.getJSONObject("disruptions");
-                        // Since the individual disruptions have their url as key(!) we have to do a bit of ugliness here...
-                        JSONArray dis = rawDisruptions.names();
-                        for (int k = 0; k < rawDisruptions.length(); k++) {
-                            String disruptionKey = dis.getString(k);
-                            disruptions.add(new Disruption(disruptionKey, rawDisruptions.getJSONObject(disruptionKey)));
-                        }
-                    }
+                    this.disruptions = Disruption.extractDisruptionsToList(rawConnection);
 
                     JSONArray rawLegs = rawConnection.getJSONArray("legs");
                     for (int i = 0; i < rawLegs.length(); i++) {
@@ -436,11 +449,29 @@ public class CHSearchProvider extends AbstractNetworkProvider {
                 } catch (JSONException x) {
                     throw new JSONException("Connection::" + x);
                 }
-
-
             }
 
+
             private static class Disruption {
+                /**
+                 * Returns a (possibly empty) List of Disruptions from a JsonObject
+                 *
+                 * @param rawObject JSONObject, usually a "leg" or "connection"
+                 * @return list of Disruptions (empty, if key "disruptions" not present)
+                 */
+                public static List<Disruption> extractDisruptionsToList(JSONObject rawObject) throws JSONException, ParseException {
+                    List<Disruption> disruptions = new ArrayList<>();
+                    if (rawObject.has("disruptions")) {
+                        JSONObject rawDisruptions = rawObject.getJSONObject("disruptions");
+                        // Since the individual disruptions have their url as key(!) we have to do a bit of ugliness here...
+                        JSONArray dis = rawDisruptions.names();
+                        for (int k = 0; k < rawDisruptions.length(); k++) {
+                            String disruptionKey = dis.getString(k);
+                            disruptions.add(new Disruption(disruptionKey, rawDisruptions.getJSONObject(disruptionKey)));
+                        }
+                    }
+                    return disruptions;
+                }
 
                 private static final SimpleDateFormat date_formatter_en = new SimpleDateFormat("dd-MM-yyyy HH:mm");
                 // unfortunately, they change the format depending on request lang..
@@ -455,7 +486,7 @@ public class CHSearchProvider extends AbstractNetworkProvider {
                 public final @Nullable
                 Date timeEnd;
 
-                public Disruption(String externalURL, JSONObject rawDisruption) throws JSONException, ParseException {
+                private Disruption(String externalURL, JSONObject rawDisruption) throws JSONException, ParseException {
                     this.externalURL = externalURL;
                     this.ID = rawDisruption.getString("id");
                     this.header = rawDisruption.getString("header");
@@ -506,12 +537,13 @@ public class CHSearchProvider extends AbstractNetworkProvider {
                 public final List<Stop> stops = new ArrayList<>();
                 public final boolean is_walk;
                 public final List<String> infotexts = new ArrayList<>();
+                public final List<Disruption> disruptions;
 
 
                 public Leg(JSONObject rawLeg) throws JSONException, ParseException {
                     try {
-                        this.departure = rawLeg.has("departure") ? DATE_TIME_FORMATTER.parse(rawLeg.getString("departure")) : DATE_TIME_FORMATTER.parse(rawLeg.getString("arrival"));
-                        this.arrival = rawLeg.has("arrival") ? DATE_TIME_FORMATTER.parse(rawLeg.getString("arrival")) : DATE_TIME_FORMATTER.parse(rawLeg.getString("departure"));
+                        this.departure = rawLeg.has("departure") ? DATE_TIME_FORMATTER.parse(rawLeg.getString("departure")) : null;
+                        this.arrival = rawLeg.has("arrival") ? DATE_TIME_FORMATTER.parse(rawLeg.getString("arrival")) : null;
                         this.type = rawLeg.has("type") ? rawLeg.getString("type") : "unknown";
                         this.is_walk = "walk".equals(this.type);
                         this.Z = rawLeg.has("*Z") ? rawLeg.getString("*Z") : "00000";
@@ -522,8 +554,13 @@ public class CHSearchProvider extends AbstractNetworkProvider {
                         this.line = rawLeg.has("line") ? rawLeg.getString("line") : null;
                         this.stopID = rawLeg.has("stopid") ? rawLeg.getString("stopid") : null;
                         this.operator = rawLeg.has("operator") ? rawLeg.getString("operator") : null;
-                        this.fgColor = rawLeg.has("fgcolor") ? Integer.parseInt(rawLeg.getString("fgcolor"), 16) : 0xff;
-                        this.bgColor = rawLeg.has("bgcolor") ? Integer.parseInt(rawLeg.getString("bgcolor"), 16) : 0x00;
+                        if (rawLeg.has("bgcolor")) {
+                            this.fgColor = hexColor2int(rawLeg.getString("fgcolor"));
+                            this.bgColor = hexColor2int(rawLeg.getString("bgcolor"));
+                        } else {
+                            this.bgColor = 0xFFFFFF; // Withe
+                            this.fgColor = 0xFF0000; // Black
+                        }
                         this.runningTime = rawLeg.has("runningtime") ? rawLeg.getDouble("runningtime") : 0;
                         this.dep_delay = rawLeg.has("dep_delay") ? delayParser(rawLeg.getString("dep_delay")) : 0;
                         this.arr_delay = rawLeg.has("arr_delay") ? delayParser(rawLeg.getString("arr_delay")) : 0;
@@ -533,6 +570,7 @@ public class CHSearchProvider extends AbstractNetworkProvider {
                         this.isAddress = rawLeg.has("isaddress") && rawLeg.getBoolean("isaddress");
                         this.exit = rawLeg.has("exit") ? new Exit(rawLeg.getJSONObject("exit")) : null;
                         this.cancelled = rawLeg.has("cancelled") && rawLeg.getBoolean("cancelled");
+                        this.disruptions = Disruption.extractDisruptionsToList(rawLeg);
 
                         if (rawLeg.has("stops") && !rawLeg.isNull("stops")) {
                             JSONArray rawStops = rawLeg.getJSONArray("stops");
@@ -667,8 +705,8 @@ public class CHSearchProvider extends AbstractNetworkProvider {
                 String[] colors = rawEntry.getString("color").split("~", 3);
                 this.dep_delay = rawEntry.has("dep_delay") ? delayParser(rawEntry.getString("dep_delay")) : 0;
                 this.arr_delay = rawEntry.has("arr_delay") ? delayParser(rawEntry.getString("arr_delay")) : 0;
-                this.fgColor = Integer.parseInt((colors[0]), 16);
-                this.bgColor = Integer.parseInt((colors[1]), 16);
+                this.fgColor = hexColor2int(colors[0]);
+                this.bgColor = hexColor2int(colors[1]);
                 this.terminal = new Terminal(rawEntry.getJSONObject("terminal"));
             }
 
