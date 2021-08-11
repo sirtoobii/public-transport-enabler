@@ -66,8 +66,8 @@ public class CHSearchProvider extends AbstractNetworkProvider {
             Capability.TRIPS_VIA
     );
 
-    public CHSearchProvider(NetworkId network) {
-        super(network);
+    public CHSearchProvider() {
+        super(NetworkId.SEARCHCH);
     }
 
     @Override
@@ -88,7 +88,7 @@ public class CHSearchProvider extends AbstractNetworkProvider {
     public NearbyLocationsResult queryNearbyLocations(Set<LocationType> types, Location location, int maxDistance, int maxLocations) throws IOException {
         ResultHeader header = new ResultHeader(network, SERVER_PRODUCT);
 
-        // Since the endpoint only supports lat/long we have to get the coordinates first (if not already supplied)
+        // Since the endpoint only supports lat/long we have to get the coordinates first (if not already supplied in the Location attribute)
         Location fixedLocation = location;
         if (location.coord == null && location.id != null) {
             SuggestLocationsResult suggestionResult = this.suggestLocations(location.id, null, 2);
@@ -135,7 +135,7 @@ public class CHSearchProvider extends AbstractNetworkProvider {
      * @param time          desired time for departing, or {@code null} for the provider default
      * @param maxDepartures maximum number of departures to get or {@code 0}
      * @param equivs        (Not supported!)
-     * @return List of departing connections
+     * @return List of Departure objects
      */
     @Override
     public QueryDeparturesResult queryDepartures(String stationId, @Nullable Date time, int maxDepartures, boolean equivs) throws IOException {
@@ -213,6 +213,8 @@ public class CHSearchProvider extends AbstractNetworkProvider {
     @Override
     public QueryTripsResult queryTrips(Location from, @Nullable Location via, Location to, Date date, boolean dep, @Nullable TripOptions options) throws IOException {
         ResultHeader header = new ResultHeader(network, SERVER_PRODUCT);
+
+        // We define all request parameters here since we can't submit "null"
         HashMap<String, String> rawParameters = new HashMap<>();
         rawParameters.put("from", from.id == null ? from.name : from.id);
         rawParameters.put("to", to.id == null ? to.name : to.id);
@@ -225,6 +227,7 @@ public class CHSearchProvider extends AbstractNetworkProvider {
 
         HttpUrl.Builder builder = API_BASE.newBuilder();
         builder.addPathSegment(TRIP_ENDPOINT);
+        // And then build the request-url with all non-null keys
         rawParameters.forEach((key, value) -> {
             if (value != null) {
                 builder.addQueryParameter(key, value);
@@ -235,7 +238,7 @@ public class CHSearchProvider extends AbstractNetworkProvider {
         try {
             RouteResult routeResult = new RouteResult(new JSONObject(res.toString()));
             if (routeResult.connections.size() == 0) {
-                // More granularity would be very tedious to implement since reasons are free-text an possibly in 4 different languages...
+                // More granularity would be very tedious to implement since reasons are free-text and possibly in 4 different languages...
                 return new QueryTripsResult(header, QueryTripsResult.Status.NO_TRIPS);
             }
             List<Trip> tripsList = new ArrayList<>(N_TRIPS);
@@ -249,16 +252,7 @@ public class CHSearchProvider extends AbstractNetworkProvider {
                     StringBuilder disruptions = new StringBuilder();
                     leg.disruptions.forEach(disruptions::append);
 
-                    // Departure
-                    Date plannedDeparture = leg.departure;
-                    Date expectedDeparture = addMinutesToDate(leg.departure, leg.dep_delay);
-                    Position planedDeparturePos;
 
-                    // Arrival Stop
-                    Position planedArrivalPos;
-
-                    Location arrivalLocation;
-                    Location departureLocation;
 
                     if (leg.exit != null) {
                         // Some legs do not have location data...
@@ -266,16 +260,22 @@ public class CHSearchProvider extends AbstractNetworkProvider {
                         Point legLocation = leg.lon != null ? Point.fromDouble(leg.lat, leg.lon) : null;
 
                         // Some bus-stops in rural areas do not have a track name..
-                        planedDeparturePos = leg.track != null ? new Position(leg.track) : null;
-                        planedArrivalPos = leg.exit.track != null ? new Position(leg.exit.track) : null;
+                        Position planedDeparturePos = leg.track != null ? new Position(leg.track) : null;
+                        Position planedArrivalPos = leg.exit.track != null ? new Position(leg.exit.track) : null;
 
+                        // Departure
+                        Date plannedDeparture = leg.departure;
+                        Date expectedDeparture = addMinutesToDate(leg.departure, leg.dep_delay);
+                        Location departureLocation = new Location(leg.isAddress ? LocationType.ADDRESS : LocationType.STATION, leg.stopID, legLocation, null, leg.name);
+                        Stop departureStop = new Stop(departureLocation, true, plannedDeparture, expectedDeparture, planedDeparturePos, null, leg.cancelled);
+
+                        // Arrival
                         Date plannedArrival = leg.exit.arrival;
                         Date expectedArrival = addMinutesToDate(leg.exit.arrival, leg.exit.arr_delay);
-                        arrivalLocation = new Location(leg.exit.isAddress ? LocationType.ADDRESS : LocationType.STATION, leg.exit.stopID, legExitLocation, null, leg.exit.name);
-                        departureLocation = new Location(leg.isAddress ? LocationType.ADDRESS : LocationType.STATION, leg.stopID, legLocation, null, leg.name);
-
-                        Stop departureStop = new Stop(departureLocation, true, plannedDeparture, expectedDeparture, planedDeparturePos, null, leg.cancelled);
+                        Location arrivalLocation = new Location(leg.exit.isAddress ? LocationType.ADDRESS : LocationType.STATION, leg.exit.stopID, legExitLocation, null, leg.exit.name);
                         Stop arrivalStop = new Stop(arrivalLocation, false, plannedArrival, expectedArrival, planedArrivalPos, null, leg.cancelled);
+
+                        // Collect possible info texts (e.g number for on-demand services)
                         String infoText = String.join(",", leg.infotexts);
                         if (leg.is_walk) {
                             legsList.add(new Trip.Individual(Trip.Individual.Type.WALK, departureLocation, plannedDeparture, arrivalLocation, plannedArrival, null, 0));
@@ -314,7 +314,7 @@ public class CHSearchProvider extends AbstractNetworkProvider {
             });
             Date lastDeparture = tripsList.get(tripsList.size() - 1).getFirstPublicLeg().getDepartureTime();
             Date firstArrival = tripsList.get(0).getLastPublicLeg().getArrivalTime();
-            CHSearchContext context = new CHSearchContext(from, to, via, firstArrival, lastDeparture, dep, options);
+            CHSearchContext context = new CHSearchContext(from, to, via, firstArrival, lastDeparture, options);
             return new QueryTripsResult(header, requestURL.toString(), from, via, to, context, tripsList);
 
         } catch (final JSONException x) {
@@ -342,6 +342,7 @@ public class CHSearchProvider extends AbstractNetworkProvider {
         HashMap<String, Product> mapping = new HashMap<>();
         mapping.put("IC", Product.HIGH_SPEED_TRAIN);
         mapping.put("ICE", Product.HIGH_SPEED_TRAIN);
+        mapping.put("IRE", Product.REGIONAL_TRAIN);
         mapping.put("TGV", Product.HIGH_SPEED_TRAIN);
         mapping.put("RJX", Product.HIGH_SPEED_TRAIN); // RailJetExpress
         mapping.put("IR", Product.HIGH_SPEED_TRAIN);
@@ -384,6 +385,11 @@ public class CHSearchProvider extends AbstractNetworkProvider {
         return 0;
     }
 
+    /**
+     * Expands shorthand hex "f0a" to "ff00aa" and adds "#" as prefix
+     * @param hexValue 3 or 6 character hex value
+     * @return Expanded and prefixed hex string
+     */
     private static String expandHex(String hexValue) {
         //Unfortunately they mix between short and long from...
         if (hexValue.length() == 3) {
@@ -406,6 +412,10 @@ public class CHSearchProvider extends AbstractNetworkProvider {
         public final List<String> messages = new ArrayList<>();
         public final List<Connection> connections = new ArrayList<>(N_TRIPS);
 
+        /**
+         * Mapping of route.json endpoint
+         * @param rawResult raw json result
+         */
         RouteResult(JSONObject rawResult) throws JSONException, ParseException {
             if (rawResult.has("error")) {
                 this.error = rawResult.getString("error");
@@ -525,28 +535,28 @@ public class CHSearchProvider extends AbstractNetworkProvider {
             }
 
             private static class Leg {
-                public final Date departure;
-                public final Date arrival;
+                public final @Nullable Date departure;
+                public final @Nullable Date arrival;
                 public final String tripID;
-                public final String stopID;
+                public final @Nullable String stopID;
                 public final String name;
                 public final String Z; // Train number
                 public final String G; // Train Product
-                public final String terminal;
-                public final String line;
+                public final @Nullable String terminal;
+                public final @Nullable String line;
                 public final String type;
-                public final String operator;
+                public final @Nullable String operator;
                 public final int fgColor;
                 public final int bgColor;
                 public final double runningTime;
                 public final int dep_delay;
                 public final int arr_delay;
-                public final String track;
-                public final Double lat;
+                public final @Nullable String track;
+                public final @Nullable Double lat;
                 public final boolean cancelled;
-                public final Double lon;
+                public final @Nullable Double lon;
                 public final boolean isAddress;
-                public final Exit exit;
+                public final @Nullable Exit exit;
                 public final List<Stop> stops = new ArrayList<>();
                 public final boolean is_walk;
                 public final List<String> infotexts = new ArrayList<>();
@@ -571,8 +581,8 @@ public class CHSearchProvider extends AbstractNetworkProvider {
                             this.fgColor = parseColor(expandHex(rawLeg.getString("fgcolor")));
                             this.bgColor = parseColor(expandHex(rawLeg.getString("bgcolor")));
                         } else {
-                            this.bgColor = 0xFFFFFF; // Withe
-                            this.fgColor = 0xFF0000; // Black
+                            this.bgColor = Style.WHITE;
+                            this.fgColor = Style.BLACK;
                         }
                         this.runningTime = rawLeg.has("runningtime") ? rawLeg.getDouble("runningtime") : 0;
                         this.dep_delay = rawLeg.has("dep_delay") ? delayParser(rawLeg.getString("dep_delay")) : 0;
@@ -608,13 +618,13 @@ public class CHSearchProvider extends AbstractNetworkProvider {
 
                 private static class Exit {
                     public final Date arrival;
-                    public final String stopID;
+                    public final @Nullable String stopID;
                     public final String name;
                     public final double waitTime;
-                    public final String track;
+                    public final @Nullable String track;
                     public final int arr_delay;
-                    public final Double lat;
-                    public final Double lon;
+                    public final @Nullable Double lat;
+                    public final @Nullable Double lon;
                     public final boolean isAddress;
 
                     Exit(JSONObject rawExit) throws JSONException, ParseException {
@@ -647,7 +657,7 @@ public class CHSearchProvider extends AbstractNetworkProvider {
                     public final Double lat;
                     public final Double lon;
                     // Sometimes the we have no real "Stop" e.g (Löschbergbasis Tunnel) which means we have no arrival/departure times
-                    public boolean isSpecial = false;
+                    public final boolean isSpecial;
 
                     Stop(JSONObject rawStop) throws JSONException, ParseException {
                         try {
@@ -655,6 +665,7 @@ public class CHSearchProvider extends AbstractNetworkProvider {
                                 // The first stop does not have an arrival attribute an similarly the last no departure
                                 this.departure = rawStop.has("departure") ? DATE_TIME_FORMATTER.parse(rawStop.getString("departure")) : DATE_TIME_FORMATTER.parse(rawStop.getString("arrival"));
                                 this.arrival = rawStop.has("arrival") ? DATE_TIME_FORMATTER.parse(rawStop.getString("arrival")) : DATE_TIME_FORMATTER.parse(rawStop.getString("departure"));
+                                this.isSpecial = false;
                             } else {
                                 this.isSpecial = true;
                                 this.departure = null;
@@ -684,6 +695,10 @@ public class CHSearchProvider extends AbstractNetworkProvider {
         public final double lon;
         public final List<StationBoardEntry> entries = new ArrayList<>();
 
+        /**
+         * Mapping of stationboard.json endpoint
+         * @param rawStationBoard raw Json object
+         */
         public StationBoardResult(JSONObject rawStationBoard) throws JSONException, ParseException {
             JSONObject rawStop = rawStationBoard.getJSONObject("stop");
             this.stationID = rawStop.getString("id");
@@ -753,17 +768,24 @@ public class CHSearchProvider extends AbstractNetworkProvider {
         Date lastDeparture;
         private final @Nullable
         Date firstArrival;
-        private final boolean isDeparture;
         private final @Nullable
         TripOptions options;
 
-        public CHSearchContext(Location from, Location to, @Nullable Location via, @Nullable Date fristArrival, @Nullable Date lastDeparture, boolean isDeparture, @Nullable TripOptions options) {
+        /**
+         * Stores a route query context to create before/after queries
+         * @param from From location
+         * @param to To location
+         * @param via Via Location
+         * @param fristArrival Arrival time of first connection
+         * @param lastDeparture Departure time of last connection
+         * @param options (currently not supported)
+         */
+        public CHSearchContext(Location from, Location to, @Nullable Location via, @Nullable Date fristArrival, @Nullable Date lastDeparture, @Nullable TripOptions options) {
             this.from = from;
             this.to = to;
             this.via = via;
             this.lastDeparture = lastDeparture;
             this.firstArrival = fristArrival;
-            this.isDeparture = isDeparture;
             this.options = options;
         }
 

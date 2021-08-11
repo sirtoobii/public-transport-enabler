@@ -18,21 +18,18 @@
 package de.schildbach.pte.live;
 
 import de.schildbach.pte.CHSearchProvider;
-import de.schildbach.pte.NetworkId;
 import de.schildbach.pte.dto.*;
 import org.junit.Test;
 
 import java.util.Date;
 
-import static org.junit.Assert.assertEquals;
-import static org.junit.Assert.fail;
 
 /**
  * @author Tobias Bossert
  */
 public class CHSearchProviderLiveTest extends AbstractProviderLiveTest {
     public CHSearchProviderLiveTest() {
-        super(new CHSearchProvider(NetworkId.SEARCHCH));
+        super(new CHSearchProvider());
     }
 
     @Test
