@@ -348,10 +348,15 @@ public class CHSearchProvider extends AbstractNetworkProvider {
         mapping.put("IR", Product.HIGH_SPEED_TRAIN);
         mapping.put("EC", Product.HIGH_SPEED_TRAIN);
         mapping.put("RE", Product.REGIONAL_TRAIN);
+        mapping.put("R", Product.REGIONAL_TRAIN);
+        mapping.put("M", Product.SUBWAY);
+        mapping.put("FUN", Product.TRAM); // Funicular railways
+        mapping.put("CC", Product.TRAM);  // Also used for funicular railways
         mapping.put("B", Product.BUS);
-        mapping.put("S", Product.REGIONAL_TRAIN);
+        mapping.put("S", Product.SUBURBAN_TRAIN);
         mapping.put("T", Product.TRAM);
         mapping.put("PB", Product.CABLECAR);
+        mapping.put("GB", Product.CABLECAR); // Gondola Lift
         mapping.put("BAT", Product.FERRY);
         return mapping.get(chSearchType);
     }
@@ -574,7 +579,9 @@ public class CHSearchProvider extends AbstractNetworkProvider {
                         this.name = rawLeg.getString("name");
                         this.terminal = rawLeg.has("terminal") ? rawLeg.getString("terminal") : null;
                         this.tripID = rawLeg.has("tripid") ? rawLeg.getString("tripid") : "generated_" + UUID.randomUUID();
-                        this.line = rawLeg.has("line") ? rawLeg.getString("line") : null;
+                        String rawLine = rawLeg.has("line") ? rawLeg.getString("line") : null;
+                        // Otherwise we could get a line named "null"
+                        this.line = "null".equals(rawLine) ? "" : rawLine;
                         this.stopID = rawLeg.has("stopid") ? rawLeg.getString("stopid") : null;
                         this.operator = rawLeg.has("operator") ? rawLeg.getString("operator") : null;
                         if (rawLeg.has("bgcolor")) {
@@ -731,7 +738,9 @@ public class CHSearchProvider extends AbstractNetworkProvider {
                 G = rawEntry.has("*G") ? rawEntry.getString("*G"): "";
                 L = rawEntry.has("*L") ?rawEntry.getString("*L"): "";
                 Z = rawEntry.has("*L") ?rawEntry.getString("*Z"): "";
-                this.line = rawEntry.getString("line");
+                String rawLine = rawEntry.getString("line");
+                // Otherwise we would get a line named "null"
+                this.line = "null".equals(rawLine) ? "" : rawLine;
                 this.operator = rawEntry.getString("operator");
                 this.track = rawEntry.getString("track");
                 String[] colors = rawEntry.getString("color").split("~", 3);
