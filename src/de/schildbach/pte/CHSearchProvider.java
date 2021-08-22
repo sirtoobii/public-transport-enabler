@@ -99,7 +99,7 @@ public class CHSearchProvider extends AbstractNetworkProvider {
             }
         }
         if (fixedLocation.coord != null) {
-            String latlon = String.format("%f,%f", fixedLocation.coord.getLatAsDouble(), fixedLocation.coord.getLonAsDouble());
+            String latlon = String.format(Locale.ROOT, "%f,%f", fixedLocation.coord.getLatAsDouble(), fixedLocation.coord.getLonAsDouble());
             HttpUrl queryUrl = API_BASE.newBuilder()
                     .addPathSegment(COMPLETION_ENDPOINT)
                     .addQueryParameter("latlon", latlon)
@@ -168,7 +168,8 @@ public class CHSearchProvider extends AbstractNetworkProvider {
                 Line line = new Line(sbEntry.Z, sbEntry.operator, type2Product(sbEntry.G), sbEntry.line, new Style(Style.Shape.RECT, sbEntry.bgColor, sbEntry.fgColor));
 
                 Location destinationLocation = new Location(LocationType.STATION, sbEntry.terminal.stationID, Point.fromDouble(sbEntry.terminal.lat, sbEntry.terminal.lon), null, sbEntry.terminal.name);
-                departures.add(new Departure(sbEntry.time, predictedTime, line, new Position(sbEntry.track), destinationLocation, null, null));
+                Position departurePos = sbEntry.track != null ? new Position(sbEntry.track) : null;
+                departures.add(new Departure(sbEntry.time, predictedTime, line, departurePos, destinationLocation, null, null));
             });
             StationDepartures sd = new StationDepartures(boardLocation, departures, null);
             QueryDeparturesResult QDres = new QueryDeparturesResult(header);
@@ -407,7 +408,7 @@ public class CHSearchProvider extends AbstractNetworkProvider {
         } else if (hexValue.length() == 6) {
             return "#" + hexValue;
         } else {
-            throw new NumberFormatException("hex value has more than six bytes");
+            throw new NumberFormatException("hex value has more than six bytes: " + hexValue);
         }
     }
 
@@ -724,7 +725,7 @@ public class CHSearchProvider extends AbstractNetworkProvider {
             public final String L;
             public final String Z;
             public final String line;
-            public final String track;
+            public final @Nullable String track;
             public final String operator;
             public final int fgColor;
             public final int bgColor;
@@ -738,16 +739,17 @@ public class CHSearchProvider extends AbstractNetworkProvider {
                 G = rawEntry.has("*G") ? rawEntry.getString("*G"): "";
                 L = rawEntry.has("*L") ?rawEntry.getString("*L"): "";
                 Z = rawEntry.has("*L") ?rawEntry.getString("*Z"): "";
-                String rawLine = rawEntry.getString("line");
+                String rawLine = rawEntry.has("line") ? rawEntry.getString("line"): null;
                 // Otherwise we would get a line named "null"
                 this.line = "null".equals(rawLine) ? "" : rawLine;
                 this.operator = rawEntry.getString("operator");
-                this.track = rawEntry.getString("track");
+                this.track = rawEntry.has("track") ? rawEntry.getString("track"): null;
                 String[] colors = rawEntry.getString("color").split("~", 3);
                 this.dep_delay = rawEntry.has("dep_delay") ? delayParser(rawEntry.getString("dep_delay")) : 0;
                 this.arr_delay = rawEntry.has("arr_delay") ? delayParser(rawEntry.getString("arr_delay")) : 0;
-                this.fgColor = parseColor(expandHex(colors[0]));
-                this.bgColor = parseColor(expandHex(colors[1]));
+                // sometimes there is no color information
+                this.fgColor = "".equals(colors[0]) ? Style.BLACK : parseColor(expandHex(colors[0]));
+                this.bgColor = "".equals(colors[1]) ? Style.WHITE : parseColor(expandHex(colors[1]));
                 this.terminal = new Terminal(rawEntry.getJSONObject("terminal"));
             }
 
