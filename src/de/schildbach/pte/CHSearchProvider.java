@@ -254,7 +254,6 @@ public class CHSearchProvider extends AbstractNetworkProvider {
                     leg.disruptions.forEach(disruptions::append);
 
 
-
                     if (leg.exit != null) {
                         // Some legs do not have location data...
                         Point legExitLocation = leg.exit.lon != null ? Point.fromDouble(leg.exit.lat, leg.exit.lon) : null;
@@ -311,10 +310,14 @@ public class CHSearchProvider extends AbstractNetworkProvider {
                         return;
                     }
                 });
+                //if the connection is just walking
+                if (numChanges.get() == -1) numChanges.set(0);
                 tripsList.add(new Trip("generated_" + UUID.randomUUID(), from, to, legsList, null, null, numChanges.get()));
             });
-            Date lastDeparture = tripsList.get(tripsList.size() - 1).getFirstPublicLeg().getDepartureTime();
-            Date firstArrival = tripsList.get(0).getLastPublicLeg().getArrivalTime();
+            // We must consider that the first/last leg may be not a "Public" one and therefore, we can not use getLastPublicLeg()
+            Date lastDeparture = tripsList.get(tripsList.size() - 1).legs.get(0).getDepartureTime();
+            Trip firstConnection = tripsList.get(0);
+            Date firstArrival = firstConnection.legs.get(firstConnection.legs.size() - 1).getArrivalTime();
             CHSearchContext context = new CHSearchContext(from, to, via, firstArrival, lastDeparture, options);
             return new QueryTripsResult(header, requestURL.toString(), from, via, to, context, tripsList);
 
@@ -393,6 +396,7 @@ public class CHSearchProvider extends AbstractNetworkProvider {
 
     /**
      * Expands shorthand hex "f0a" to "ff00aa" and adds "#" as prefix
+     *
      * @param hexValue 3 or 6 character hex value
      * @return Expanded and prefixed hex string
      */
@@ -420,6 +424,7 @@ public class CHSearchProvider extends AbstractNetworkProvider {
 
         /**
          * Mapping of route.json endpoint
+         *
          * @param rawResult raw json result
          */
         RouteResult(JSONObject rawResult) throws JSONException, ParseException {
@@ -541,28 +546,38 @@ public class CHSearchProvider extends AbstractNetworkProvider {
             }
 
             private static class Leg {
-                public final @Nullable Date departure;
-                public final @Nullable Date arrival;
+                public final @Nullable
+                Date departure;
+                public final @Nullable
+                Date arrival;
                 public final String tripID;
-                public final @Nullable String stopID;
+                public final @Nullable
+                String stopID;
                 public final String name;
                 public final String Z; // Train number
                 public final String G; // Train Product
-                public final @Nullable String terminal;
-                public final @Nullable String line;
+                public final @Nullable
+                String terminal;
+                public final @Nullable
+                String line;
                 public final String type;
-                public final @Nullable String operator;
+                public final @Nullable
+                String operator;
                 public final int fgColor;
                 public final int bgColor;
                 public final double runningTime;
                 public final int dep_delay;
                 public final int arr_delay;
-                public final @Nullable String track;
-                public final @Nullable Double lat;
+                public final @Nullable
+                String track;
+                public final @Nullable
+                Double lat;
                 public final boolean cancelled;
-                public final @Nullable Double lon;
+                public final @Nullable
+                Double lon;
                 public final boolean isAddress;
-                public final @Nullable Exit exit;
+                public final @Nullable
+                Exit exit;
                 public final List<Stop> stops = new ArrayList<>();
                 public final boolean is_walk;
                 public final List<String> infotexts = new ArrayList<>();
@@ -626,13 +641,17 @@ public class CHSearchProvider extends AbstractNetworkProvider {
 
                 private static class Exit {
                     public final Date arrival;
-                    public final @Nullable String stopID;
+                    public final @Nullable
+                    String stopID;
                     public final String name;
                     public final double waitTime;
-                    public final @Nullable String track;
+                    public final @Nullable
+                    String track;
                     public final int arr_delay;
-                    public final @Nullable Double lat;
-                    public final @Nullable Double lon;
+                    public final @Nullable
+                    Double lat;
+                    public final @Nullable
+                    Double lon;
                     public final boolean isAddress;
 
                     Exit(JSONObject rawExit) throws JSONException, ParseException {
@@ -705,6 +724,7 @@ public class CHSearchProvider extends AbstractNetworkProvider {
 
         /**
          * Mapping of stationboard.json endpoint
+         *
          * @param rawStationBoard raw Json object
          */
         public StationBoardResult(JSONObject rawStationBoard) throws JSONException, ParseException {
@@ -725,7 +745,8 @@ public class CHSearchProvider extends AbstractNetworkProvider {
             public final String L;
             public final String Z;
             public final String line;
-            public final @Nullable String track;
+            public final @Nullable
+            String track;
             public final String operator;
             public final int fgColor;
             public final int bgColor;
@@ -736,14 +757,14 @@ public class CHSearchProvider extends AbstractNetworkProvider {
 
             public StationBoardEntry(JSONObject rawEntry) throws JSONException, ParseException {
                 this.time = DATE_TIME_FORMATTER.parse(rawEntry.getString("time"));
-                G = rawEntry.has("*G") ? rawEntry.getString("*G"): "";
-                L = rawEntry.has("*L") ?rawEntry.getString("*L"): "";
-                Z = rawEntry.has("*L") ?rawEntry.getString("*Z"): "";
-                String rawLine = rawEntry.has("line") ? rawEntry.getString("line"): null;
+                G = rawEntry.has("*G") ? rawEntry.getString("*G") : "";
+                L = rawEntry.has("*L") ? rawEntry.getString("*L") : "";
+                Z = rawEntry.has("*L") ? rawEntry.getString("*Z") : "";
+                String rawLine = rawEntry.has("line") ? rawEntry.getString("line") : null;
                 // Otherwise we would get a line named "null"
                 this.line = "null".equals(rawLine) ? "" : rawLine;
                 this.operator = rawEntry.getString("operator");
-                this.track = rawEntry.has("track") ? rawEntry.getString("track"): null;
+                this.track = rawEntry.has("track") ? rawEntry.getString("track") : null;
                 String[] colors = rawEntry.getString("color").split("~", 3);
                 this.dep_delay = rawEntry.has("dep_delay") ? delayParser(rawEntry.getString("dep_delay")) : 0;
                 this.arr_delay = rawEntry.has("arr_delay") ? delayParser(rawEntry.getString("arr_delay")) : 0;
@@ -784,12 +805,13 @@ public class CHSearchProvider extends AbstractNetworkProvider {
 
         /**
          * Stores a route query context to create before/after queries
-         * @param from From location
-         * @param to To location
-         * @param via Via Location
-         * @param fristArrival Arrival time of first connection
+         *
+         * @param from          From location
+         * @param to            To location
+         * @param via           Via Location
+         * @param fristArrival  Arrival time of first connection
          * @param lastDeparture Departure time of last connection
-         * @param options (currently not supported)
+         * @param options       (currently not supported)
          */
         public CHSearchContext(Location from, Location to, @Nullable Location via, @Nullable Date fristArrival, @Nullable Date lastDeparture, @Nullable TripOptions options) {
             this.from = from;
